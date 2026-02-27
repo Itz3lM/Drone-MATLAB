@@ -1,0 +1,212 @@
+clear
+close all
+clc
+
+set(groot,"defaultAxesColorOrder", orderedcolors("gem"))
+
+%%% ------- VARIABLES -------
+%% Park
+L = 50;
+park = rand(L,L) <0.001;
+
+%% Sensors
+fire = ones(5,5); %kernel of 5x5
+person = ones(3,3); %kernel of 3x3
+
+fire_detection   = conv2(double(park), fire, "same");
+person_detection = conv2(double(park), person, "same");
+
+%% Time
+
+dt = 1; %simulation step
+Tsim = 1000; %total sim time
+gps_dt = 15; %GPS update period
+
+%% Drone
+% -- positions (km) --
+x_true = 1;
+y_true = 1; 
+
+% -- estimated state --
+x_est = 1;
+y_est = 1;
+
+% -- sensor precision --
+gps_state = 0;     % satellite connection state
+gps_precision_good = 0.02;
+gps_precision_bad  = 0.1;
+internal_precision = 0.25; % given ±0.25 km
+
+% -- velocities (km/s)  -- 
+vx = 0; 
+vy = 0;
+
+%% Logs
+x_log = zeros(Tsim,1);
+y_log = zeros(Tsim,1);
+
+%%% ------- REFERENCE -------
+
+mode = 'person';   % or 'person'
+
+if strcmp(mode,'fire')
+    step = 5;
+elseif strcmp(mode,'person')
+    step = 3;
+else
+    error('Invalid mode. Choose fire or person')
+end
+
+waypoints = [];
+direction = 1; % 1 = left->right, -1 = right->left
+
+for y = 1:step:L %adapts to either fire or person
+    
+    if direction == 1
+        waypoints = [waypoints; 1 y; L y];
+    else
+        waypoints = [waypoints; L y; 1 y];
+    end
+    
+    direction = -direction;  % flip direction
+    
+end
+
+figure
+imagesc(park)
+colormap(gray)
+axis equal tight
+hold on
+
+plot(waypoints(:,1), waypoints(:,2), 'r', 'LineWidth', 2)
+title('Zig-Zag Reference Path')
+
+figure
+imagesc(park)
+colormap(gray)
+axis equal tight
+hold on
+
+plot(waypoints(:,1), waypoints(:,2), '--b')
+h_traj = plot(NaN, NaN, 'r', 'LineWidth', 2);   % trajectory line
+h_drone = plot(NaN, NaN, 'bo', 'MarkerSize',8,'MarkerFaceColor','c'); % drone
+legend('Reference','Trajectory','Drone')
+title('Drone Live Motion')
+
+%%% ------- MOTION UPDATE + CONTROL -------
+
+
+%% -------- PARAMETERS --------
+Kp = 0.5;
+Ki = 0.01;
+
+Vmax = 0.2;        % max velocity
+int_max = 10;      % anti-windup limit
+
+int_ex = 0;
+int_ey = 0;
+
+wp_index = 1;
+
+x_log = [];
+y_log = [];
+
+gps_drop_x = [];
+gps_drop_y = [];
+
+%% -------- MAIN LOOP --------
+for k = 1:10000
+
+    % --- Current waypoint ---
+    x_ref = waypoints(wp_index,1);
+    y_ref = waypoints(wp_index,2);
+
+    % --- Compute error using ESTIMATED position ---
+    ex = x_ref - x_est;
+    ey = y_ref - y_est;
+
+    % --- Integral update ---
+    int_ex = int_ex + ex*dt;
+    int_ey = int_ey + ey*dt;
+
+    % --- Anti-windup clamp ---
+    int_ex = max(min(int_ex, int_max), -int_max);
+    int_ey = max(min(int_ey, int_max), -int_max);
+
+    % --- PI controller ---
+    vx = Kp*ex + Ki*int_ex;
+    vy = Kp*ey + Ki*int_ey;
+
+    % --- Velocity saturation ---
+    vnorm = norm([vx vy]);
+    if vnorm > Vmax
+        vx = vx * Vmax / vnorm;
+        vy = vy * Vmax / vnorm;
+    end
+
+    % --- TRUE POSITION UPDATE ---
+    x_true = x_true + vx*dt;
+    y_true = y_true + vy*dt;
+
+    % --- Keep inside park ---
+    x_true = max(1, min(50, x_true));
+    y_true = max(1, min(50, y_true));
+
+    % GPS updates every 15s
+    if mod(k,gps_dt) == 0
+
+        r = rand;
+
+        if r < 0.7
+            gps_state = 1;   % GOOD
+        elseif r < 0.9
+            gps_state = 2;   % DEGRADED
+        else
+            gps_state = 3;   % LOST
+        end
+
+        if gps_state == 1
+            x_est = x_true + gps_precision_good*randn;
+            y_est = y_true + gps_precision_good*randn;
+            set(h_drone,'MarkerFaceColor','c')  % cyan = GOOD
+
+        elseif gps_state == 2
+            x_est = x_true + gps_precision_bad*randn;
+            y_est = y_true + gps_precision_bad*randn;
+            set(h_drone,'MarkerFaceColor','y')  % yellow = DEGRADED
+
+        else
+            x_est = x_true + internal_precision*(2*rand-1);
+            y_est = y_true + internal_precision*(2*rand-1);
+            set(h_drone,'MarkerFaceColor','r')  % red = LOST
+        end
+    end
+
+    % --- Waypoint switching ---
+    if norm([x_true - x_ref, y_true - y_ref]) < 0.5
+        if wp_index < size(waypoints,1)
+            wp_index = wp_index + 1;
+        else
+            break
+        end
+    end
+
+    % --- Log trajectory ---
+    x_log = [x_log; x_true];
+    y_log = [y_log; y_true];
+
+    % --- Log GPS lost locations ---
+    if gps_state == 3
+        gps_drop_x = [gps_drop_x; x_true];
+        gps_drop_y = [gps_drop_y; y_true];
+    end
+
+    % --- Update animation ---
+    set(h_traj,'XData',x_log,'YData',y_log);
+    set(h_drone,'XData',x_true,'YData',y_true);
+
+    drawnow
+    pause(0.01)
+
+end
+plot(gps_drop_x, gps_drop_y, 'yx', 'MarkerSize',8, 'LineWidth',2)
