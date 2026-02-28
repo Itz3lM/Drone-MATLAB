@@ -4,152 +4,201 @@ clc
 
 set(groot,"defaultAxesColorOrder", orderedcolors("gem"))
 
-%% ================= PARK =================
+rng('shuffle'); % rnd seed reproducible
+
+%%% ------- VARIABLES -------
+%% Park
 L = 50;
-park = rand(L,L) < 0.001;
+park = rand(L,L) <0.001;
 
-%% ================= TIME =================
-dt     = 1;
-Tsim   = 5000;
-gps_dt = 15;
+%% Sensors
+fire = ones(5,5); %kernel of 5x5
+person = ones(3,3); %kernel of 3x3
 
-%% ================= DISTURBANCE =================
-A = 0.03;
-f = 0.01;
+fire_detection   = conv2(double(park), fire, "same");
+person_detection = conv2(double(park), person, "same");
 
-%% ================= DRONE =================
-x_true = 1;  y_true = 1;
-x_est  = 1;  y_est  = 1;
+%% Time
 
-vx = 0; vy = 0;
+dt = 0.1; %simulation step
+Tsim = 1000; %total sim time
+gps_dt = 15; %GPS update period
 
-%% ================= GPS =================
+%% Drone
+% -- positions (km) --
+x_true = 1;
+y_true = 1; 
+
+% -- estimated state --
+x_est = 1;
+y_est = 1;
+
+% -- sensor precision --
+gps_state = 0;     % satellite connection state
 gps_precision_good = 0.02;
-gps_precision_bad  = 0.5;
-internal_precision = 0.25;
-gps_state = 1;
+gps_precision_bad  = 0.1;
+internal_precision = 0.25; % given ±0.25 km
 
-%% ================= CONTROL =================
-Kp = 0.5;
-Ki = 0.01;
-Vmax = 0.2;
-int_max = 10;
+% -- velocities (km/s)  -- 
+vx = 0; 
+vy = 0;
 
-int_ex = 0;
-int_ey = 0;
+%% Logs
+x_log = zeros(Tsim,1);
+y_log = zeros(Tsim,1);
 
-%% ================= REFERENCE =================
-mode = 'person';
+%%% ------- REFERENCE -------
+
+mode = 'person';   % 'fire' or 'person'
 
 if strcmp(mode,'fire')
     step = 5;
-else
+elseif strcmp(mode,'person')
     step = 3;
+else
+    error('Invalid mode. Choose fire or person')
 end
 
 waypoints = [];
-direction = 1;
+direction = 1; % 1 = left->right, -1 = right->left
 
-for y = 1:step:L
+for y = 1:step:L %adapts to either fire or person
+    
     if direction == 1
         waypoints = [waypoints; 1 y; L y];
     else
         waypoints = [waypoints; L y; 1 y];
     end
-    direction = -direction;
+    
+    direction = -direction;  % flip direction
+    
 end
 
-wp_index = 1;
-
-%% ================= FIGURE =================
 figure
 imagesc(park)
 colormap(gray)
 axis equal tight
 hold on
-plot(waypoints(:,1), waypoints(:,2),'--b')
-h_traj  = plot(NaN,NaN,'r','LineWidth',2);
-h_drone = plot(NaN,NaN,'bo','MarkerSize',8,'MarkerFaceColor','c');
-title('Drone Simulation')
+
+plot(waypoints(:,1), waypoints(:,2), 'r', 'LineWidth', 2)
+title('Zig-Zag Reference Path')
+
+figure
+imagesc(park)
+colormap(gray)
+axis equal tight
+hold on
+
+plot(waypoints(:,1), waypoints(:,2), '--b')
+h_traj = plot(NaN, NaN, 'r', 'LineWidth', 2);   % trajectory line
+h_drone = plot(NaN, NaN, 'bo', 'MarkerSize',8,'MarkerFaceColor','c'); % drone
 legend('Reference','Trajectory','Drone')
+title('Drone Live Motion')
 
-%% ================= LOGS =================
-x_log = [];
-y_log = [];
-ex_log = [];
-ey_log = [];
-mse_log = [];
-wind_log = [];
+%%% ------- MOTION UPDATE + CONTROL -------
 
-%% ================= MAIN LOOP =================
-for k = 1:Tsim
 
-    % ---- Disturbance ----
-    wind_x = A*sin(2*pi*f*k*dt);
+%% -------- PARAMETERS --------
+Kp = 0.6;
+Ki = 0.02;
 
-    % ---- TRUE MOTION ----
+Vmax = 0.25;        % max velocity
+int_max = 5;      % anti-windup limit
+
+int_ex = 0;
+int_ey = 0;
+
+wp_index = 1;
+
+N = 40000; % Declarar N primero
+
+x_log = zeros(N,1);
+y_log = zeros(N,1);
+gps_drop_x = zeros(N,1);
+gps_drop_y = zeros(N,1);
+
+ex_log = zeros(N,1);
+ey_log = zeros(N,1);
+error_log = zeros(N,1);
+wind_x_log = zeros(N,1);
+
+drop_index = 1;
+
+%% -------- MAIN LOOP --------
+for k = 1:N
+
+    % --- Current waypoint ---
+    x_ref = waypoints(wp_index,1);
+    y_ref = waypoints(wp_index,2);
+
+    % --- Compute error using ESTIMATED position ---
+    ex = x_ref - x_est;
+    ey = y_ref - y_est;
+
+    % --- Integral update ---
+    if gps_state ~= 3   % solo integra si GPS no está perdido
+    int_ex = int_ex + ex*dt;
+    int_ey = int_ey + ey*dt;
+    end
+    % --- Anti-windup clamp ---
+    int_ex = max(min(int_ex, int_max), -int_max);
+    int_ey = max(min(int_ey, int_max), -int_max);
+
+    % --- PI controller ---
+    vx = Kp*ex + Ki*int_ex;
+    vy = Kp*ey + Ki*int_ey;
+
+    % --- Velocity saturation ---
+    vnorm = norm([vx vy]);
+    if vnorm > Vmax
+        vx = vx * Vmax / vnorm;
+        vy = vy * Vmax / vnorm;
+    end
+
+    % --- Wind pattern --- 
+    wind_amp = 0.005;
+    wind_x = wind_amp*sin(0.01*k) + 0.02*randn;
+    
+    % --- TRUE POSITION UPDATE ---
     x_true = x_true + vx*dt + wind_x;
     y_true = y_true + vy*dt;
 
-    x_true = max(1,min(L,x_true));
-    y_true = max(1,min(L,y_true));
+    % --- Keep inside park ---
+    x_true = max(1, min(50, x_true));
+    y_true = max(1, min(50, y_true));
 
-    % ---- GPS UPDATE ----
+    % GPS updates every 15s
     if mod(k,gps_dt) == 0
 
         r = rand;
 
         if r < 0.7
-            gps_state = 1;
+            gps_state = 1;   % GOOD
         elseif r < 0.9
-            gps_state = 2;
+            gps_state = 2;   % DEGRADED
         else
-            gps_state = 3;
+            gps_state = 3;   % LOST
         end
 
         if gps_state == 1
             x_est = x_true + gps_precision_good*randn;
             y_est = y_true + gps_precision_good*randn;
-            set(h_drone,'MarkerFaceColor','c')
+            set(h_drone,'MarkerFaceColor','c')  % cyan = GOOD
 
         elseif gps_state == 2
             x_est = x_true + gps_precision_bad*randn;
             y_est = y_true + gps_precision_bad*randn;
-            set(h_drone,'MarkerFaceColor','y')
+            set(h_drone,'MarkerFaceColor','y')  % yellow = DEGRADED
 
         else
             x_est = x_true + internal_precision*(2*rand-1);
             y_est = y_true + internal_precision*(2*rand-1);
-            set(h_drone,'MarkerFaceColor','r')
+            set(h_drone,'MarkerFaceColor','r')  % red = LOST
         end
     end
 
-    % ---- Current waypoint ----
-    x_ref = waypoints(wp_index,1);
-    y_ref = waypoints(wp_index,2);
-
-    % ---- Error ----
-    ex = x_ref - x_est;
-    ey = y_ref - y_est;
-
-    int_ex = int_ex + ex*dt;
-    int_ey = int_ey + ey*dt;
-
-    int_ex = max(min(int_ex,int_max),-int_max);
-    int_ey = max(min(int_ey,int_max),-int_max);
-
-    % ---- PI Control ----
-    vx = Kp*ex + Ki*int_ex;
-    vy = Kp*ey + Ki*int_ey;
-
-    vnorm = norm([vx vy]);
-    if vnorm > Vmax
-        vx = vx * Vmax/vnorm;
-        vy = vy * Vmax/vnorm;
-    end
-
-    % ---- Waypoint switching ----
-    if norm([x_true-x_ref,y_true-y_ref]) < 0.5
+    % --- Waypoint switching ---
+    if norm([x_est - x_ref, y_est - y_ref]) < 0.5
         if wp_index < size(waypoints,1)
             wp_index = wp_index + 1;
         else
@@ -157,52 +206,91 @@ for k = 1:Tsim
         end
     end
 
-    % ---- Logs ----
-    x_log = [x_log; x_true];
-    y_log = [y_log; y_true];
-    ex_log = [ex_log; ex];
-    ey_log = [ey_log; ey];
-    mse_log = [mse_log; ex^2 + ey^2];
-    wind_log = [wind_log; wind_x];
+    % --- Log trajectory ---
+    x_log(k) = x_true;
+    y_log(k) = y_true;
+    ex_log(k) = ex;         % Error en X
+    ey_log(k) = ey;         % Error en Y
+    error_log(k) = norm([ex ey]); % Error conjunto
 
-    % ---- Animation ----
-    set(h_traj,'XData',x_log,'YData',y_log);
-    set(h_drone,'XData',x_true,'YData',y_true);
-    drawnow
+    % --- Log GPS lost locations ---
+    if gps_state == 3
+    gps_drop_x(drop_index) = x_true;
+    gps_drop_y(drop_index) = y_true;
+    drop_index = drop_index + 1;
+    end
 
+    % --- Update animation ---
+    if mod(k,50) == 0
+        set(h_traj,'XData',x_log(1:k),'YData',y_log(1:k));
+        set(h_drone,'XData',x_true,'YData',y_true);
+        drawnow limitrate
+    end
 end
+k_end = k;
+x_log = x_log(1:k_end);
+y_log = y_log(1:k_end);
+ex_log = ex_log(1:k_end);
+ey_log = ey_log(1:k_end);
+error_log = error_log(1:k_end);
+wind_x_log = wind_x_log(1:k_end);
 
-%% ================= ERROR PLOTS =================
-t = (0:length(ex_log)-1)*dt;
+gps_drop_x = gps_drop_x(1:drop_index-1);
+gps_drop_y = gps_drop_y(1:drop_index-1);
 
+mse_x = mean(ex_log.^2);
+mse_y = mean(ey_log.^2);
+mse_joint = mean(error_log.^2);
+
+fprintf('\n--- Mean Squared Error (MSE) ---\n');
+fprintf('MSE en X: %.4f km^2\n', mse_x);
+fprintf('MSE en Y: %.4f km^2\n', mse_y);
+fprintf('MSE Conjunto: %.4f km^2\n', mse_joint);
+
+% Figure 1: Parque + referencia + GPS lost
+figure
+imagesc(park)
+colormap(gray)
+axis equal tight
+hold on
+plot(waypoints(:,1), waypoints(:,2), '--b', 'LineWidth',1.5)
+plot(gps_drop_x, gps_drop_y, 'yx', 'MarkerSize',8, 'LineWidth',2)
+legend('Reference path','GPS lost')
+title('GPS Lost Locations')
+
+% Figure 2: Tracking error
 figure
 subplot(3,1,1)
-plot(t,ex_log)
-title('Error in X')
+plot(1:k_end, ex_log, 'r', 'LineWidth', 1)
+title('Error de Posición en X')
+ylabel('Error (km)')
+grid on
 
 subplot(3,1,2)
-plot(t,ey_log)
-title('Error in Y')
+plot(1:k_end, ey_log, 'b', 'LineWidth', 1)
+title('Error de Posición en Y')
+ylabel('Error (km)')
+grid on
 
 subplot(3,1,3)
-plot(t,mse_log)
-title('Joint Error (MSE)')
-xlabel('Time (s)')
+plot(1:k_end, error_log, 'k', 'LineWidth', 1.2)
+title('Error Conjunto (Norma)')
+ylabel('Error (km)')
+xlabel('Iteración')
+grid on
 
-figure
-plot(t,wind_log)
-title('Wind Disturbance')
-xlabel('Time (s)')
-
-%% ================= STATE UPDATE PLOTS =================
+% Figure 3: State vs perturbations
 figure
 subplot(2,1,1)
-plot(t, x_log)
-title('State Update: X Position')
-ylabel('km')
+plot(1:k_end, wind_x_log, 'r')
+title('Señal de Perturbación (Viento en X)')
+ylabel('Amplitud (km)')
+grid on
 
 subplot(2,1,2)
-plot(t, y_log)
-title('State Update: Y Position')
-xlabel('Time (s)')
-ylabel('km')
+plot(1:k_end, x_log, 'r', 1:k_end, y_log, 'b')
+title('Actualización del Estado (Posición del Dron)')
+legend('Posición X', 'Posición Y')
+xlabel('Iteración')
+ylabel('Posición (km)')
+grid on
