@@ -193,3 +193,16 @@ figure
 plot(t,wind_log)
 title('Wind Disturbance')
 xlabel('Time (s)')
+
+%% ================= STATE UPDATE PLOTS =================
+figure
+subplot(2,1,1)
+plot(t, x_log)
+title('State Update: X Position')
+ylabel('km')
+
+subplot(2,1,2)
+plot(t, y_log)
+title('State Update: Y Position')
+xlabel('Time (s)')
+ylabel('km')
